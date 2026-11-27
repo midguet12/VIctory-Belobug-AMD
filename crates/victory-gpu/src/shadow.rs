@@ -214,6 +214,27 @@ fn resolve_card_limits(
 /// Defaults scale with the adapter's local VRAM budget (16 MiB / 512 MiB on
 /// `<= 12 GiB` budgets, 4 MiB / 2048 MiB on 16 GB cards, 1 MiB / up to 8192 MiB
 /// on `>= 20 GiB` budgets), and explicit env vars always override.
+/// Whether the card is one whose shaders are slow on buffers in the PC's memory: an NVIDIA
+/// card (`VICTORY_BUS_READS_SLOW=0`/`1` says so for any card).
+///
+/// Measured on an RTX 5070 Ti, replays of one gameplay frame at 1080p: 57 ms on the card with
+/// the copies where a run puts them by default (title buffers of 4 MiB and more on the card,
+/// the others and the windows in the PC's memory), 322 ms with every buffer in the PC's
+/// memory, and 47 ms with the buffers up to 64 MiB on the card, the dispatches 8 ms of it
+/// instead of 28. Live, same spot, standing: 84 ms a frame and the card 76% busy by default;
+/// 53 ms and 52% with `VICTORY_CARD_BUFFERS_MIN_KB=64` and `VICTORY_WINDOWS_BAR_MB=4096`
+/// (67 ms against 120 at 3840x2160). So on such a card those two are the defaults
+/// ([`card_limits`], [`window_mapped_most`]); the variables still say otherwise. The RX 7900
+/// XTX's figures are of the other defaults, which stay for it.
+fn bus_reads_slow() -> bool {
+    static SLOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SLOW.get_or_init(|| match std::env::var("VICTORY_BUS_READS_SLOW").ok().as_deref() {
+        Some("0") => false,
+        Some("1") => true,
+        _ => host().is_some_and(|h| crate::indirect::nvidia(&h.device)),
+    })
+}
+
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
@@ -233,6 +254,9 @@ fn card_limits() -> (u64, u64) {
             && kib > 0
         {
             min_bytes = kib << 10;
+        } else if bus_reads_slow() && env_mb("VICTORY_CARD_BUFFERS_MIN_MB").is_none() {
+            // Every title buffer, where nothing says otherwise ([`bus_reads_slow`]).
+            min_bytes = 64 << 10;
         }
         if card_all() {
             min_bytes = 0;
@@ -508,7 +532,9 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 fn window_mapped_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MOST.get_or_init(|| {
-        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+        // (4096 where shaders are slow on the PC's memory, [`bus_reads_slow`])
+        let default = if bus_reads_slow() { 4096 } else { 0 };
+        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(default) << 20
     })
 }
 

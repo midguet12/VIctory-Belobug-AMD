@@ -2325,6 +2325,35 @@ fn rehash_runs() -> bool {
 /// hashed, and compare passes after the lists.
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Since the last frame-rate line, what went up to copies in the card's
+/// memory by kind of copy: those shaders were ever declared to write, those
+/// never declared of 16 MiB or more, and the other never declared ones; of
+/// each the copies, the ranges, the bytes, and the ranges that went as words.
+/// Then microseconds: finding what changed, taking it, the list, and the
+/// whole of `Host::card_before`.
+static SEND_SPLIT: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
+fn send_split_note(dirty: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)]) {
+    for (shadow, ranges) in dirty {
+        let kind = if shadow.written() {
+            0
+        } else if shadow.span().1 >= 16 << 20 {
+            1
+        } else {
+            2
+        };
+        let add = |i: usize, n: u64| SEND_SPLIT[kind * 4 + i].fetch_add(n, Ordering::Relaxed);
+        add(0, 1);
+        add(1, ranges.len() as u64);
+        add(2, ranges.iter().map(|&(a, b)| (b - a) as u64).sum());
+        add(3, ranges.iter().filter(|&&(a, b)| crate::host::send::goes_as_words(a, b - a)).count() as u64);
+    }
+}
+
+fn send_split_time(i: usize, since: std::time::Instant) {
+    SEND_SPLIT[12 + i].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
 /// Whether what shaders wrote to copies in the card's memory is merged
 /// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
 /// default). The pieces the card's compare found differing come down in
@@ -4480,8 +4509,11 @@ impl Host {
             None => 0,
         };
         let gathering = crate::timeline::span("copies in the card's memory: what changed");
+        let began = std::time::Instant::now();
         let mut dirty = crate::shadow::card_dirty(sent_as);
         gathering.end();
+        send_split_time(0, began);
+        send_split_note(&dirty);
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
             return None;
         }
@@ -4507,8 +4539,11 @@ impl Host {
         let mut up = None;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
+        let began = std::time::Instant::now();
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
+        send_split_time(1, began);
+        let began = std::time::Instant::now();
         if !dirty.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
@@ -4636,6 +4671,7 @@ impl Host {
             }
             used.push((false, sync));
         }
+        send_split_time(2, began);
         drop(order);
         let mut plan = CardPlan {
             ranges: Vec::new(),
@@ -5928,7 +5964,9 @@ impl Host {
             shadow.writing(*at, *len);
         }
         let declared = declared_writes(runs);
+        let began = std::time::Instant::now();
         let card = self.card_before(&declared, &picked, flown);
+        send_split_time(3, began);
         // The sends are taken: from here on the references hold what the
         // copies in the lists put.
         for (shadow, at, bytes) in batch.placed.drain(..) {
@@ -9428,6 +9466,7 @@ impl Meter {
             let planes = crate::resource::PLANES[0].swap(0, Ordering::Relaxed) as f64 / frames;
             // Copies in the card's memory (`crate::shadow::cards`).
             let card = crate::shadow::card_stats();
+            let split: Vec<f64> = SEND_SPLIT.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
             #[cfg(feature = "diagnostics")]
             let slow = crate::watch::slow_asks();
             // Over the same frames as the counts above.
@@ -9529,6 +9568,27 @@ impl Meter {
                         per_frame(4) / 1e6,
                         per_frame(5),
                         per_frame(6) / 1e3
+                    );
+                    let kind = |k: usize| {
+                        format!(
+                            "{:.0} copies, {:.0} ranges ({:.0} as words), {:.2} MB",
+                            split[k * 4],
+                            split[k * 4 + 1],
+                            split[k * 4 + 3],
+                            split[k * 4 + 2] / 1e6
+                        )
+                    };
+                    tracing::info!(
+                        "what went up per frame, by kind of copy: shaders write it: {}; never declared, 16 MiB or more: {}; \
+                         never declared, smaller: {}; {:.1} ms finding what changed, {:.1} taking it, {:.1} the list, \
+                         {:.1} in all with the compare's list",
+                        kind(0),
+                        kind(1),
+                        kind(2),
+                        split[12] / 1e3,
+                        split[13] / 1e3,
+                        split[14] / 1e3,
+                        split[15] / 1e3
                     );
                 }
                 tracing::info!(

@@ -46,6 +46,8 @@ pub mod frame;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod book;
 #[cfg(windows)]
+mod heap;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;

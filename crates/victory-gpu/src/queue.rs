@@ -1077,6 +1077,8 @@ fn frame_ends() {
             behind::leave();
         }
     });
+    // (With `VICTORY_HEAP_KEEP=1` and the switch among those that change.)
+    crate::heap::keeping(crate::ab::pick("VICTORY_HEAP_KEEP").unwrap_or(true));
     if let Some(on) = crate::ab::pick("VICTORY_LANE_CORE") {
         static WAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if WAS.swap(on, std::sync::atomic::Ordering::Relaxed) != on {

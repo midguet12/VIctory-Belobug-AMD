@@ -362,6 +362,9 @@ pub(crate) fn line(frames: f64) {
         CHUNKS.swap(0, Relaxed) as f64 / frames,
         s[3]
     );
+    if times_on() {
+        times_line(frames);
+    }
 }
 
 #[inline]
@@ -428,6 +431,8 @@ macro_rules! plain {
         #[allow(clippy::upper_case_acronyms, non_camel_case_types)]
         #[repr(u64)]
         enum Plain { $($op),* , END }
+        /// Their names, for [`times_line`].
+        const PLAIN_NAMES: &[&str] = &[$(stringify!($op)),*];
         $(extern "system" fn $name(this: This $(, $a: $t)*) {
             front(this).put(Plain::$op as u64, &[$(Word::word($a)),*]);
         })*
@@ -499,6 +504,88 @@ const TARGETS: u64 = after(13);
 const CLEAR_RTV: u64 = after(14);
 const CLEAR_DSV: u64 = after(15);
 const COPY_TEXTURE: u64 = after(16);
+const OTHER_NAMES: [&str; 17] = [
+    "RESET", "CLOSE", "UPLOAD", "BARRIER", "BARRIER_GROUPS", "VIEWPORTS", "SCISSORS", "BLEND_FACTOR", "HEAPS",
+    "COMPUTE_CONSTANTS", "GRAPHICS_CONSTANTS", "INDEX_BUFFER", "VERTEX_BUFFERS", "TARGETS", "CLEAR_RTV",
+    "CLEAR_DSV", "COPY_TEXTURE",
+];
+
+/// `VICTORY_THIN_TIMES=1`: where the translating threads' time goes, by kind of call
+/// (diagnostics; two clock reads a call).
+fn times_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN_TIMES").is_some_and(|v| v == "1"))
+}
+
+/// A call that long is counted apart: it waited for something.
+const SLOW_NS: u64 = 1_000_000;
+/// Per kind of call since the last line: calls, nanoseconds, calls over [`SLOW_NS`], their
+/// nanoseconds.
+static OP_TIMES: [[AtomicU64; 4]; 64] = [const { [const { AtomicU64::new(0) }; 4] }; 64];
+/// The translating threads' processor time in [`translate`] since the last line: user and
+/// kernel microseconds.
+static CPU_TIMES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+#[inline]
+fn note_time(op: u64, began: std::time::Instant) {
+    let ns = began.elapsed().as_nanos() as u64;
+    let Some(t) = OP_TIMES.get(op as usize) else { return };
+    t[0].fetch_add(1, Relaxed);
+    t[1].fetch_add(ns, Relaxed);
+    if ns >= SLOW_NS {
+        t[2].fetch_add(1, Relaxed);
+        t[3].fetch_add(ns, Relaxed);
+    }
+}
+
+/// This thread's processor time so far (user, kernel), in microseconds.
+fn thread_cpu() -> (u64, u64) {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: our own thread and four valid out pointers.
+    unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) };
+    let micros = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime)) / 10;
+    (micros(user), micros(kernel))
+}
+
+/// The line of `VICTORY_THIN_TIMES`.
+fn times_line(frames: f64) {
+    let name = |op: usize| {
+        PLAIN_NAMES.get(op).or_else(|| OTHER_NAMES.get(op.wrapping_sub(Plain::END as usize))).copied().unwrap_or("?")
+    };
+    let mut kinds: Vec<(usize, [f64; 4])> = OP_TIMES
+        .iter()
+        .enumerate()
+        .map(|(op, t)| (op, [0, 1, 2, 3].map(|k| t[k].swap(0, Relaxed) as f64 / frames)))
+        .filter(|(_, t)| t[0] > 0.0)
+        .collect();
+    kinds.sort_by(|a, b| b.1[1].total_cmp(&a.1[1]));
+    let all: f64 = kinds.iter().map(|k| k.1[1]).sum();
+    let slow: f64 = kinds.iter().map(|k| k.1[3]).sum();
+    let cpu = [0, 1].map(|k| CPU_TIMES[k].swap(0, Relaxed) as f64 / frames / 1000.0);
+    tracing::info!(
+        "list calls by kind per frame (VICTORY_THIN_TIMES): {:.1} ms in the calls, {:.1} of them in calls over 1 ms; the threads ran {:.1} ms user + {:.1} ms kernel while translating; {}",
+        all / 1e6,
+        slow / 1e6,
+        cpu[0],
+        cpu[1],
+        kinds
+            .iter()
+            .map(|(op, t)| format!(
+                "{} {:.0}x {:.1} ms ({:.1} us each; {:.1} over 1 ms, {:.1} ms)",
+                name(*op),
+                t[0],
+                t[1] / 1e6,
+                t[1] / t[0] / 1e3,
+                t[2],
+                t[3] / 1e6
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
 
 /// The bytes of `count` things at `items` (none if null).
 fn bytes_of<'a, T>(items: *const T, count: usize) -> &'a [u8] {
@@ -712,6 +799,8 @@ extern "system" fn copy_texture_region_x(
 /// closed it. Once `left` says so only what must not be lost is done.
 fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool) {
     let (mut i, mut calls, mut closed) = (0, 0, false);
+    let timed = times_on();
+    let cpu = timed.then(thread_cpu);
     let mut skip = left();
     while i < stream.len() {
         let (op, len) = (stream[i] & 0xffff, (stream[i] >> 16) as usize);
@@ -732,7 +821,11 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
         if skip && op != CLOSE && op != RESET {
             continue;
         }
+        let began = timed.then(std::time::Instant::now);
         if run_plain(op, list, w) {
+            if let Some(began) = began {
+                note_time(op, began);
+            }
             continue;
         }
         let n = w.first().map_or(0, |&n| n as usize);
@@ -811,6 +904,14 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             }
             _ => {}
         }
+        if let Some(began) = began {
+            note_time(op, began);
+        }
+    }
+    if let Some((user, kernel)) = cpu {
+        let now = thread_cpu();
+        CPU_TIMES[0].fetch_add(now.0.saturating_sub(user), Relaxed);
+        CPU_TIMES[1].fetch_add(now.1.saturating_sub(kernel), Relaxed);
     }
     (calls, closed)
 }

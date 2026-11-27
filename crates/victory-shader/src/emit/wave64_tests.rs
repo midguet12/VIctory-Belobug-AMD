@@ -1289,8 +1289,13 @@ const DS_READ_B32: u8 = 0x36;
 
 /// The wave size `native` lowers to on a host of 32-lane waves.
 fn flag_wave(native: &NativeProgram) -> Option<u32> {
+    flag_wave_wide(native, &HashSet::new())
+}
+
+/// [`flag_wave`] with the branches closing `wide` taken wave-wide.
+fn flag_wave_wide(native: &NativeProgram, wide: &HashSet<usize>) -> Option<u32> {
     let p = crate::spill::build(native).expect("build");
-    let st = structure::structure(&p).expect("structure");
+    let st = structure::structure_wide(&p, wide).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, native).expect("io::raise");
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
@@ -1321,6 +1326,50 @@ fn a_branch_that_only_raises_an_lds_flag_runs_in_waves_of_32() {
 fn a_branch_that_writes_lds_two_different_values_keeps_64_lanes() {
     // a second value after the read: what the flag ends up holding depends on what was read
     assert_eq!(flag_wave(&flag_program(Some(2))), Some(64));
+}
+
+/// A host of 32-lane waves refuses the pipeline of a program left at 64 lanes (NVIDIA: its
+/// dispatches are dropped). What `emit` does last of all for one whose halves only share LDS:
+/// the branches around the LDS accesses the lowering names are taken wave-wide, as `widen`
+/// does, and the program runs in waves of 32.
+#[test]
+fn a_branch_that_reads_and_writes_lds_runs_in_waves_of_32_once_taken_wave_wide() {
+    let native = flag_program(Some(2));
+    let p = crate::spill::build(&native).expect("build");
+    // nothing for the halves to exchange: LDS is all they share
+    assert!(!lower::crosses_halves(&p, &structure::structure(&p).expect("structure")));
+    let mut wide = HashSet::new();
+    let mut rounds = 0;
+    let wave = loop {
+        lower::take_needs();
+        let wave = flag_wave_wide(&native, &wide);
+        let needs = lower::take_needs();
+        if wave != Some(64) {
+            break wave;
+        }
+        // per lane it keeps 64 lanes, and the lowering names the blocks of its LDS accesses
+        assert!(!needs.is_empty(), "64 lanes with no block named");
+        let st = structure::structure_wide(&p, &wide).expect("structure");
+        let more: Vec<usize> = lower::branches_around(&st, &needs)
+            .expect("branches around the LDS accesses")
+            .into_iter()
+            .filter(|b| !wide.contains(b))
+            .collect();
+        assert!(!more.is_empty(), "no branch left to take wave-wide");
+        wide.extend(more);
+        rounds += 1;
+    };
+    assert!(rounds > 0, "64 lanes per lane first");
+    assert_eq!(wave, Some(32));
+}
+
+#[test]
+fn a_wave_or_crosses_the_halves_of_a_wave() {
+    // a program reducing over the wave is not one whose halves only share LDS
+    let native = program(0xBF88_0000);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let names: Vec<&str> = p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
+    assert!(lower::crosses_halves(&p, &structure::structure(&p).expect("structure")), "{names:?}");
 }
 
 #[test]

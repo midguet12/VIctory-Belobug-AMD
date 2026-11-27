@@ -68,6 +68,9 @@ impl Shard {
     /// noted it first.
     fn note(&mut self, page: usize, parts: u16, now: u64) -> u64 {
         let before = self.written.get(&page).copied().unwrap_or(0);
+        // (First, and under the part's lock: who reads it with the part held
+        // finds no note above it.)
+        noted(page).fetch_max(now, std::sync::atomic::Ordering::Relaxed);
         self.written.insert(page, before.max(now));
         if parts == WHOLE || !parts_on() {
             if now >= before {
@@ -93,6 +96,24 @@ impl Shard {
             None => WHOLE,
         }
     }
+}
+
+/// The pages of a block of [`NOTED`]: 1 MiB.
+const NOTED_SHIFT: u32 = 4;
+
+/// For each MiB of title memory, a number no lower than any asking noted for
+/// a page of it ([`Shard::note`], the only place notes are made). By the
+/// MiB's number folded into the table: two that fall on one entry share it,
+/// which only makes it higher.
+///
+/// For [`nothing_new`]: whether a range holds a note newer than what a copy
+/// took was found by walking the notes of all its pages, 2,800 of them for
+/// the title's ring of constants, some 9,700 times a frame (session ab3, an
+/// RTX 5070 Ti: 5 % of the samples of the thread that prepares submissions).
+static NOTED: [std::sync::atomic::AtomicU64; 1 << 17] = [const { std::sync::atomic::AtomicU64::new(0) }; 1 << 17];
+
+fn noted(page: usize) -> &'static std::sync::atomic::AtomicU64 {
+    &NOTED[(page >> NOTED_SHIFT) & (NOTED.len() - 1)]
 }
 
 /// The pages of a part of the journal ([`Notes`]): pieces of
@@ -189,9 +210,36 @@ impl Notes {
         }
     }
 
+    /// Whether the blocks' numbers ([`NOTED`]) say that no page of
+    /// `[first, last)` has a note above what a copy took of it (`taken`, a
+    /// number for each of these pages, and `ranged`, for all of them);
+    /// `false` if they cannot say: then the notes say ([`Notes::each`]). A
+    /// part at a time, held as there.
+    fn none_newer(&self, first: usize, last: usize, taken: &[u64], ranged: u64) -> bool {
+        let Some(pieces) = pieces(first, last) else {
+            return false;
+        };
+        pieces.into_iter().all(|(from, to)| {
+            let _part = self.read(shard_of(from));
+            let mut page = from;
+            while page < to {
+                let end = (((page >> NOTED_SHIFT) + 1) << NOTED_SHIFT).min(to);
+                let newest = noted(page).load(std::sync::atomic::Ordering::Relaxed);
+                // (The least of the block's pages: no higher than any page's.)
+                if newest > ranged && newest > taken[page - first..end - first].iter().copied().min().unwrap_or(0) {
+                    return false;
+                }
+                page = end;
+            }
+            true
+        })
+    }
+
     /// The notes of pages `[first, last)` in page order. A part at a time.
     fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
-        let mut out = Vec::new();
+        // (Room for a note of every page, of long ranges for some: the
+        // title's ring of constants has 2,800 pages and notes of most.)
+        let mut out = Vec::with_capacity(crate::host::room(last.saturating_sub(first).min(4096)));
         self.each(first, last, |p, w| {
             out.push((p, w));
             true
@@ -271,10 +319,13 @@ impl Held<'_> {
     /// The notes of pages `[first, last)` in page order; their parts held.
     fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
         match pieces(first, last) {
-            Some(pieces) => pieces
-                .into_iter()
-                .flat_map(|(from, to)| self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)))
-                .collect(),
+            Some(pieces) => {
+                let mut out = Vec::with_capacity(crate::host::room(last.saturating_sub(first).min(4096)));
+                for (from, to) in pieces {
+                    out.extend(self.shard(from).written.range(from..to).map(|(&p, &w)| (p, w)));
+                }
+                out
+            }
             None => {
                 let all = if self.write.is_empty() {
                     self.read.iter().flat_map(|s| s.written.range(first..last)).map(|(&p, &w)| (p, w)).collect::<Vec<_>>()
@@ -1382,7 +1433,8 @@ pub(crate) fn nothing_new(start: usize, end: usize, base: usize, copied: &[u64],
         return false;
     };
     (ranged != 0 || taken.iter().all(|&at| at != 0))
-        && j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged))
+        && (crate::toggled!("VICTORY_NOTED") && j.notes.none_newer(first, last, taken, ranged)
+            || j.notes.each(first, last, |page, write| write <= taken[page - first].max(ranged)))
 }
 
 impl Tracked {
@@ -5739,6 +5791,36 @@ mod port7_tests {
         assert_eq!(s.parts_since(3, 10), 0b100);
         assert_eq!(s.parts_since(3, 9), WHOLE);
         assert_eq!(s.written[&3], 12);
+    }
+
+    /// What the blocks' numbers say of a range ([`NOTED`]) is never more than
+    /// its notes say, and they do say that a range taken whole after every
+    /// note holds nothing newer.
+    #[test]
+    fn blocks_numbers_never_say_more_than_the_notes() {
+        const P: usize = 1 << SHARD_SHIFT;
+        let notes = Notes::new();
+        let mut seed = 11;
+        let base = 300 * P;
+        for n in 1..3000u64 {
+            let page = base + rng(&mut seed, 3 * P);
+            let mut held = notes.hold(shards_of_pages([page]), true);
+            held.note(page, WHOLE, n);
+        }
+        let mut same = 0;
+        for _ in 0..4000 {
+            let first = base + rng(&mut seed, 3 * P);
+            let last = first + 1 + rng(&mut seed, 40);
+            let ranged = if rng(&mut seed, 2) == 0 { 0 } else { rng(&mut seed, 3500) as u64 };
+            let taken: Vec<u64> = (first..last).map(|_| 2000 + rng(&mut seed, 1500) as u64).collect();
+            let by_notes = notes.each(first, last, |page, write| write <= taken[page - first].max(ranged));
+            let by_blocks = notes.none_newer(first, last, &taken, ranged);
+            assert!(by_notes || !by_blocks, "{first}..{last}: the blocks say nothing is newer, the notes that something is");
+            same += usize::from(by_notes);
+        }
+        assert!(same > 0, "no range of the test had nothing newer");
+        assert!(notes.none_newer(base, base + 3 * P, &vec![0; 3 * P], u64::MAX / 2));
+        assert!(!notes.none_newer(base, base + 3 * P, &vec![0; 3 * P], 0));
     }
 
     /// Many threads note pages (holding their parts for writing, a number

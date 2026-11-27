@@ -432,7 +432,10 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
     // name a list twice.
     let mut steps = Vec::new();
     for list in runs {
-        for (i, step) in list.deferred().copies.iter().enumerate() {
+        let deferred = list.deferred();
+        does.reserve(room(deferred.copies.len()));
+        steps.reserve(room(deferred.copies.len()));
+        for (i, step) in deferred.copies.iter().enumerate() {
             does.push(match step {
                 &Step::Copy(dst, src, len) => Does::Copy {
                     dst,

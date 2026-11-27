@@ -191,8 +191,17 @@ pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {
 /// for a fence runs it later, and the title may reset the list meanwhile.
 /// With it go the upload memory and the dynamic descriptor slots its
 /// commands name, kept until it has run.
+///
+/// In memory of its own: a host list with its draw state is 2 KB, and a
+/// submission's were moved whole each time its vector grew or was joined to
+/// the one before (session ab3, an RTX 5070 Ti: 1.5 % of the samples of the
+/// thread that prepares submissions were the heap growing those vectors).
 #[cfg(windows)]
-pub(crate) struct Detached {
+pub(crate) struct Detached(Box<Taken>);
+
+/// What a [`Detached`] holds.
+#[cfg(windows)]
+struct Taken {
     host: crate::host::HostList,
     _uploads: Vec<Upload>,
     _state: crate::draw::State,
@@ -200,15 +209,19 @@ pub(crate) struct Detached {
 
 #[cfg(windows)]
 impl Detached {
+    fn new(host: crate::host::HostList, uploads: Vec<Upload>, state: crate::draw::State) -> Detached {
+        Detached(Box::new(Taken { host, _uploads: uploads, _state: state }))
+    }
+
     pub(crate) fn host(&self) -> &crate::host::HostList {
-        &self.host
+        &self.0.host
     }
 
     /// Releases this list's dynamic descriptor slots once its GPU submission
     /// has completed, without waiting for the full `bury_lag` (64 submissions)
     /// allocator delay: preventing dynamic slot exhaustion at ~10k draws/frame.
     pub(crate) fn release_tables(&mut self) {
-        self._state.tables_done();
+        self.0._state.tables_done();
     }
 }
 
@@ -276,7 +289,8 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
-    for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+    for (i, detached) in lists.into_iter().enumerate() {
+        let Taken { host, _uploads, _state } = *detached.0;
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
@@ -424,25 +438,9 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
         let single = earlier.is_empty() && gate.is_empty();
         let mut pieces: Vec<(Vec<ValueWait>, Detached)> = earlier
             .into_iter()
-            .map(|part| {
-                (
-                    part.waits,
-                    Detached {
-                        host: part.host,
-                        _uploads: Vec::new(),
-                        _state: Default::default(),
-                    },
-                )
-            })
+            .map(|part| (part.waits, Detached::new(part.host, Vec::new(), Default::default())))
             .collect();
-        pieces.push((
-            gate,
-            Detached {
-                host,
-                _uploads: uploads,
-                _state: state,
-            },
-        ));
+        pieces.push((gate, Detached::new(host, uploads, state)));
         let mut last = None;
         for (waits, detached) in pieces {
             if !waits.is_empty() {
@@ -467,8 +465,8 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
 /// its next reset: what was taken, and which of them run in what order.
 #[cfg(windows)]
 pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
-    let mut taken: Vec<(This, Detached)> = Vec::new();
-    let mut order = Vec::new();
+    let mut taken: Vec<(This, Detached)> = Vec::with_capacity(crate::host::room(lists.len()));
+    let mut order = Vec::with_capacity(crate::host::room(lists.len()));
     for &this in lists {
         if this.is_null() {
             continue;
@@ -498,14 +496,7 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
         };
         host.settle_standing();
         order.push(taken.len());
-        taken.push((
-            this,
-            Detached {
-                host,
-                _uploads: uploads,
-                _state: state,
-            },
-        ));
+        taken.push((this, Detached::new(host, uploads, state)));
     }
     (taken.into_iter().map(|(_, d)| d).collect(), order)
 }

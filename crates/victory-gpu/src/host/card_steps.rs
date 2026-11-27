@@ -404,10 +404,24 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
         None => crate::shadow::find(from as u64, (to - from) as u64).ok_or("no host copy of it")?,
     };
     let (start, len) = shadow.span();
-    if shadow.in_place() || (from as u64) < start || to as u64 > start + len {
+    if shadow.in_place() && !in_place_too() || (from as u64) < start || to as u64 > start + len {
         return Err("no host copy holds all of it");
     }
     Ok(shadow)
+}
+
+/// Whether what is read out of title memory the card has in place (`crate::port`,
+/// `crate::inplace`) is taken on the card as well (`VICTORY_CARD_STEPS_IN_PLACE=1`; off).
+///
+/// With the title's heap in place (`VICTORY_PORT_CONSTANTS=1`) nothing lands, but the fill
+/// of the ring's constants still read title memory on the CPU and so waited for every
+/// flight that may write the heap: on an RTX 5070 Ti one settle a frame, 90 ms of a 137 ms
+/// frame with the card's own work at 57 ms (a replay of the frame). The buffer in place is
+/// the title's memory itself: a copy out of it on the card, behind the flights on the
+/// queue, reads what they wrote, and what the title wrote is there without a refresh.
+fn in_place_too() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_STEPS_IN_PLACE").is_some_and(|v| v == "1"))
 }
 
 /// What the steps of `runs` do, and which step each is (its list by address,

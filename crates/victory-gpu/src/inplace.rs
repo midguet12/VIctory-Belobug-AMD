@@ -1067,6 +1067,35 @@ unsafe fn cost(p: &mut Probe, rig: &mut Rig, memory: &dyn Fn() -> Option<[u64; 4
                 shared(),
                 ms(speed)
             ));
+            // How fast the CPU writes and reads it while the heap stands, against memory of
+            // the same kind that is not opened (both touched first; the best of three).
+            let timed = |at: *mut u8| {
+                let words = std::slice::from_raw_parts_mut(at.cast::<u64>(), bytes / 8);
+                words.fill(1);
+                let (mut write, mut read) = (f64::MAX, f64::MAX);
+                for round in 0..3u64 {
+                    let started = std::time::Instant::now();
+                    words.fill(round + 2);
+                    write = write.min(started.elapsed().as_secs_f64() * 1000.0);
+                    let started = std::time::Instant::now();
+                    let sum = words.iter().fold(0u64, |a, w| a.wrapping_add(*w));
+                    read = read.min(started.elapsed().as_secs_f64() * 1000.0);
+                    std::hint::black_box(sum);
+                }
+                (write, read)
+            };
+            let plain = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE).cast::<u8>();
+            if opened.is_ok() && !plain.is_null() {
+                let (there, other) = (timed(base), timed(plain));
+                p.lines.push(format!(
+                    "cost, the CPU over those {mb} MB with the heap standing: written in {:.1} ms, read in {:.1} ms; over memory not opened: \
+                     written in {:.1} ms, read in {:.1} ms",
+                    there.0, there.1, other.0, other.1
+                ));
+            }
+            if !plain.is_null() {
+                mem::VirtualFree(plain.cast(), 0, mem::MEM_RELEASE);
+            }
             drop((placed, opened));
             mem::VirtualFree(base.cast(), 0, mem::MEM_RELEASE);
         }

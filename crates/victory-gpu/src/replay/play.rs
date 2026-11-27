@@ -652,16 +652,24 @@ impl Player {
         };
         let mut at = Instant::now();
         // (each step named in its error: a device lost while loading says no more than that)
-        player.make_resources(options.buffers, &options.only_buffers).context("making the resources")?;
-        step("resources", &mut at);
-        player.make_pipelines(options.shaders.as_deref()).context("making the pipelines")?;
-        step("pipelines", &mut at);
-        player.make_descriptors().context("making the descriptors")?;
-        step("descriptors", &mut at);
-        player.load_contents().context("loading the contents")?;
-        step("contents", &mut at);
-        player.make_masters(options.buffers, options.restore).context("making the copies to restore from")?;
-        step("copies to restore from", &mut at);
+        let mut load = |player: &mut Player| -> Result<()> {
+            player.make_resources(options.buffers, &options.only_buffers).context("making the resources")?;
+            step("resources", &mut at);
+            player.make_pipelines(options.shaders.as_deref()).context("making the pipelines")?;
+            step("pipelines", &mut at);
+            player.make_descriptors().context("making the descriptors")?;
+            step("descriptors", &mut at);
+            player.load_contents().context("loading the contents")?;
+            step("contents", &mut at);
+            player.make_masters(options.buffers, options.restore).context("making the copies to restore from")?;
+            step("copies to restore from", &mut at);
+            Ok(())
+        };
+        if let Err(e) = load(&mut player) {
+            // With `--debug-layer`, what it said: the reason, where the device's error has none.
+            let said = player.info.as_ref().map(debug_messages).unwrap_or_default();
+            return Err(if said.is_empty() { e } else { e.context(format!("the debug layer said: {}", said.join(" | "))) });
+        }
         let steps: Vec<String> = steps
             .iter()
             .map(|(w, d)| format!("{w} {:.1} s", d.as_secs_f64()))
@@ -768,8 +776,12 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // Flags a replay has no use for: sharing, display, not zeroed; and not resident,
+        // which the run makes its memory with to wait for it itself (`crate::host::resident`,
+        // `VICTORY_WAIT_RESIDENT`). A replay does not make it resident afterwards, and the
+        // first copy into such a resource hung an RTX 5070 Ti (the device lost while the
+        // contents were loaded, in every replay there).
+        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x800 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -1394,9 +1406,13 @@ impl Player {
         // Batches of parts with their place in the buffer.
         let mut batches: Vec<Vec<(usize, u64)>> = vec![Vec::new()];
         let (mut at, mut most) = (0u64, 0u64);
+        // `VICTORY_REPLAY_LOAD_EACH=<n>`: batches of at most n parts, each waited for, to find
+        // the copy a card hangs on (the error then names the parts).
+        let each: Option<usize> = std::env::var("VICTORY_REPLAY_LOAD_EACH").ok().and_then(|v| v.trim().parse().ok());
         for (i, (_, len, _)) in parts.iter().enumerate() {
             at = at.next_multiple_of(512);
-            if at + len > STAGING && at > 0 {
+            let full = each.is_some_and(|n| batches.last().is_some_and(|b| b.len() >= n.max(1)));
+            if (at + len > STAGING || full) && at > 0 {
                 batches.push(Vec::new());
                 at = 0;
             }
@@ -1463,6 +1479,12 @@ impl Player {
             let sent = worker.send(|l| copy(self, l, &list, &buffer));
             self.worker = worker;
             stagings[k].2 = sent?;
+            if each.is_some() {
+                let (first, last) = (batch.first().map_or(0, |b| b.0), batch.last().map_or(0, |b| b.0));
+                self.worker
+                    .wait(stagings[k].2)
+                    .with_context(|| format!("parts {first}..={last} of {} (batch {n} of {})", parts.len(), batches.len()))?;
+            }
         }
         self.worker.idle()?;
         Ok(())
@@ -1494,19 +1516,25 @@ impl Player {
             .map(|c| (c.clone(), c.len, c.file))
             .collect();
         let missing = self.frame.contents.len() - textures.len();
-        self.worker.run(|list| {
+        // A thousand at a time, each sent and waited for: in one list, the first use of
+        // every resource of a frame at once (55,000 of them, 5.7 GB) took an RTX 5070 Ti
+        // longer than the system lets a submission take, and the device was lost (hung).
+        // A lost device completes its fences, so it is asked for after each.
+        let device = self.device.clone();
+        // SAFETY: a plain query.
+        let alive = |what: &str, n: usize| unsafe { device.GetDeviceRemovedReason() }.with_context(|| format!("{what}, part {n}"));
+        for (n, all) in early.chunks(1000).enumerate() {
             // SAFETY: an open list; live resources.
-            unsafe {
-                for all in early.chunks(1000) {
-                    list.ResourceBarrier(all);
-                }
-                list.ResourceBarrier(&[alias()]);
-                for all in into.chunks(1000) {
-                    list.ResourceBarrier(all);
-                }
-            }
-        })
-        .context("the states to load into")?;
+            self.worker.run(|list| unsafe { list.ResourceBarrier(all) })?;
+            alive("the states of the idle resources", n)?;
+        }
+        // SAFETY: an open list.
+        self.worker.run(|list| unsafe { list.ResourceBarrier(&[alias()]) })?;
+        for (n, all) in into.chunks(1000).enumerate() {
+            // SAFETY: an open list; live resources.
+            self.worker.run(|list| unsafe { list.ResourceBarrier(all) })?;
+            alive("the states to load into", n)?;
+        }
         let file = File::open(self.folder.join("contents.bin"))?;
         self.upload(&textures, &file, |player, list, parts, staging| {
             for (c, len, at) in parts {
@@ -1514,6 +1542,9 @@ impl Player {
                     continue;
                 };
                 let r = &player.frame.resources[o.index];
+                if std::env::var_os("VICTORY_REPLAY_LOAD_EACH").is_some() {
+                    eprintln!("LOAD res {} first {} count {} len {} at {}: {:?} {:?}", c.res, c.first, c.count, len, at, r.desc, r.place);
+                }
                 // SAFETY: an open list; live resources.
                 unsafe {
                     if r.desc.dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0 {

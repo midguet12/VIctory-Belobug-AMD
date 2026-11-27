@@ -543,6 +543,10 @@ pub fn emit(
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
         let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // Unset, that form is still taken last of all (below) by the programs nothing else
+        // helps and whose halves only share LDS; `VICTORY_WAVE_WIDE=0` turns that off too.
+        let wide_last = std::env::var_os("VICTORY_WAVE_WIDE").is_none();
+        let mut deep = None;
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
@@ -553,7 +557,7 @@ pub fn emit(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
-                let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+                deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
@@ -621,6 +625,28 @@ pub fn emit(
                 report("local waves (APPROXIMATE, any mask)", &local);
                 if done(&local) {
                     return local.map(|(shader, _)| shader);
+                }
+            }
+        }
+        // Still 64 lanes, which a host of 32-lane waves refuses the pipeline of (NVIDIA: the
+        // program's dispatches are dropped). Where the halves of the wave only share LDS (no
+        // cross-lane code: nothing for them to exchange), the per-lane branches around the
+        // LDS accesses are taken wave-wide ([`widen`], which only takes a thread group of one
+        // console wave). Last, so that no program another form translates changes: the two
+        // that lost the card with this form (above) are taken by the local waves before it.
+        // (`GpuParticleUpdate:CS_Visibility`, refused on an RTX 5070 Ti.)
+        if wide_last && !wide_on && !lower::crosses_halves(p, st) {
+            let bases = [
+                deep.as_ref().map(|f| &f.0),
+                forms[1].1.as_ref().map(|f| &f.0),
+                forms[0].1.as_ref().map(|f| &f.0),
+                Some(p),
+            ];
+            if let Some(base) = bases.into_iter().flatten().next() {
+                let again = widen(c, native, base, why);
+                report("wave-wide branches (halves sharing LDS only)", &again);
+                if done(&again) {
+                    return again.map(|(shader, _)| shader);
                 }
             }
         }

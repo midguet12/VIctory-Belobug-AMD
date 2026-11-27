@@ -531,6 +531,22 @@ pub(super) fn needs_every_lane(what: &str) -> bool {
     what.ends_with("where not every lane runs") || what == MASK_ELSEWHERE
 }
 
+/// Whether a console wave64 program has code that crosses the 32-lane halves of its wave
+/// (`v_mbcnt`, `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers, lane-constant
+/// masks, branches the wave takes together): run as two host waves of 32, those halves have
+/// to exchange. Without any, the halves only share LDS.
+pub(super) fn crosses_halves(p: &Program, st: &Structured) -> bool {
+    p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        let n = i.name();
+        n.starts_with("v_mbcnt")
+            || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+            || n.starts_with("ds_permute")
+            || n.starts_with("ds_bpermute")
+            || reads_mask_as_data(st, i)
+    }) || lane_constant_masks(st)
+        || !st.wide.is_empty()
+}
+
 /// The blocks where the last lowering on this thread wanted every lane and did not have it
 /// (its "... where not every lane runs" refusals), which it forgets.
 pub(super) fn take_needs() -> Vec<usize> {
@@ -1850,15 +1866,7 @@ impl<'a> Lower<'a> {
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
             if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
-                let crosses = insts().any(|i| {
-                    let n = i.name();
-                    n.starts_with("v_mbcnt")
-                        || matches!(n, "v_readlane_b32" | "v_writelane_b32")
-                        || n.starts_with("ds_permute")
-                        || n.starts_with("ds_bpermute")
-                        || reads_mask_as_data(x.st, i)
-                }) || lane_constant_masks(x.st)
-                    || !x.st.wide.is_empty();
+                let crosses = crosses_halves(p, x.st);
                 if !crosses && (s.lds_dwords == 0 || group <= 32) {
                     wave = 32;
                 } else {

@@ -1375,6 +1375,9 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// It stands for a closed list, but is open and empty as its reset left
+    /// it ([`HostList::stand_closed`]).
+    standing: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -3190,6 +3193,21 @@ fn blamed(why: usize, us: u64) {
 fn log_blame(frames: f64) {
     let all = BLAME.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     let wide = WIDE_WRITES.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    if std::env::var_os("VICTORY_WIDE_WRITES").is_some_and(|v| v == "1") {
+        // Which declare most: by the bytes they declare a frame.
+        let mut most: Vec<_> = wide.iter().collect();
+        most.sort_unstable_by_key(|((a, b, _), (n, _))| std::cmp::Reverse((b - a) as u64 * n));
+        let line: Vec<String> = most
+            .iter()
+            .take(10)
+            .map(|((a, b, _), (n, shaders))| format!("{a:#x}+{:.1} MiB {:.1}x by {shaders}", (b - a) as f64 / 1048576.0, *n as f64 / frames))
+            .collect();
+        tracing::info!(
+            "shader writes declared over a megabyte or more, per frame ({} kinds; VICTORY_WIDE_WRITES): {}",
+            most.len(),
+            line.join("; ")
+        );
+    }
     let mut all: Vec<_> = all.into_iter().collect();
     all.sort_unstable_by_key(|(_, (_, us, _))| std::cmp::Reverse(*us));
     for ((kind, why, len, from, size), (n, us, at)) in all.into_iter().take(5) {
@@ -4413,6 +4431,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                standing: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6641,8 +6660,41 @@ impl HostList {
         times
     }
 
+    /// A list just reset takes the place of a closed one, which the title's
+    /// next call resets: with `VICTORY_LIST_STAND=1` it is left open, and
+    /// that reset leaves the host's list as it is (off by default, not
+    /// measured yet: closed here and reset again there).
+    ///
+    /// A submission took the host side of each of its lists and gave the
+    /// list another, closed: a host list taken from those kept, which are
+    /// reset when their run is over, was closed for that, empty, and reset
+    /// once more when the title began its next recording. Closing and
+    /// resetting lists was 7 % of the submitting thread's samples on an
+    /// RTX 5070 Ti (session auto-prof2: 5.4 % in the driver's Close, 2 % in
+    /// its allocator's Reset).
+    pub(crate) fn stand_closed(&self) {
+        static ON: OnceLock<bool> = OnceLock::new();
+        let on = || *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_STAND").is_some_and(|v| v == "1"));
+        #[cfg(feature = "diagnostics")]
+        let on = || crate::ab::pick("VICTORY_LIST_STAND").unwrap_or_else(on);
+        if on() {
+            self.standing.store(true, Ordering::Release);
+        } else {
+            self.close();
+        }
+    }
+
+    /// Before the list is run or kept as a part: closed, if it only stood
+    /// for a closed one (it was submitted again with no reset between).
+    pub(crate) fn settle_standing(&self) {
+        if self.standing.load(Ordering::Acquire) {
+            self.close();
+        }
+    }
+
     pub(crate) fn close(&self) {
         let _closing = crate::timeline::span("closing a host list");
+        self.standing.store(false, Ordering::Release);
         self.twins_to_depth();
         self.textures_back();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -6698,6 +6750,9 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
+        // Open and empty already ([`HostList::stand_closed`]), unless
+        // something was recorded into it all the same.
+        let standing = self.standing.swap(false, Ordering::AcqRel) && self.untouched();
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
@@ -6727,10 +6782,14 @@ impl HostList {
             }
         }
         // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
+        let reset = if standing {
+            Ok(())
+        } else {
+            unsafe {
+                self.allocator
+                    .Reset()
+                    .and_then(|()| self.list.Reset(&self.allocator, None))
+            }
         };
         if let Err(e) = reset {
             fail(format_args!("a host command list did not reset ({e})"));

@@ -651,15 +651,16 @@ impl Player {
             *at = Instant::now();
         };
         let mut at = Instant::now();
-        player.make_resources(options.buffers, &options.only_buffers)?;
+        // (each step named in its error: a device lost while loading says no more than that)
+        player.make_resources(options.buffers, &options.only_buffers).context("making the resources")?;
         step("resources", &mut at);
-        player.make_pipelines(options.shaders.as_deref())?;
+        player.make_pipelines(options.shaders.as_deref()).context("making the pipelines")?;
         step("pipelines", &mut at);
-        player.make_descriptors()?;
+        player.make_descriptors().context("making the descriptors")?;
         step("descriptors", &mut at);
-        player.load_contents()?;
+        player.load_contents().context("loading the contents")?;
         step("contents", &mut at);
-        player.make_masters(options.buffers, options.restore)?;
+        player.make_masters(options.buffers, options.restore).context("making the copies to restore from")?;
         step("copies to restore from", &mut at);
         let steps: Vec<String> = steps
             .iter()
@@ -1504,7 +1505,8 @@ impl Player {
                     list.ResourceBarrier(all);
                 }
             }
-        })?;
+        })
+        .context("the states to load into")?;
         let file = File::open(self.folder.join("contents.bin"))?;
         self.upload(&textures, &file, |player, list, parts, staging| {
             for (c, len, at) in parts {
@@ -1538,7 +1540,8 @@ impl Player {
                     }
                 }
             }
-        })?;
+        })
+        .context("copying the contents in")?;
         // To the states of the frame's start.
         let mut back = Vec::new();
         for r in &self.frame.resources {
@@ -1554,7 +1557,8 @@ impl Player {
                 // SAFETY: an open list; live resources.
                 unsafe { list.ResourceBarrier(all) };
             }
-        })?;
+        })
+        .context("the states of the frame's start")?;
         if missing > 0 {
             self.note(format!(
                 "contents of {missing} parts of resources that could not be made are left out"

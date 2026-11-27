@@ -2350,6 +2350,69 @@ fn send_split_note(dirty: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, 
     }
 }
 
+/// Since the last line of them, per copy in the card's memory (its title
+/// span): submissions that sent to it, ranges, ranges as words, bytes, and
+/// the submissions whose shaders were declared to write it, with the bytes
+/// declared. Then the frames since.
+type SendTop = (std::collections::HashMap<(u64, u64), [u64; 6]>, f64);
+static SEND_TOP: Mutex<Option<SendTop>> = Mutex::new(None);
+
+fn send_top_note(dirty: &[(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)], declared: &[Declared]) {
+    let mut top = SEND_TOP.lock().unwrap_or_else(|e| e.into_inner());
+    let (all, _) = top.get_or_insert_with(Default::default);
+    for (shadow, ranges) in dirty {
+        let s = all.entry(shadow.span()).or_default();
+        s[0] += 1;
+        s[1] += ranges.len() as u64;
+        s[2] += ranges.iter().filter(|&&(a, b)| crate::host::send::goes_as_words(a, b - a)).count() as u64;
+        s[3] += ranges.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>();
+    }
+    for (shadow, ranges) in declared {
+        let s = all.entry(shadow.span()).or_default();
+        s[4] += 1;
+        s[5] += ranges.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>();
+    }
+}
+
+/// The line of [`SEND_TOP`], every fifth frame-rate line.
+fn send_top_line(frames: f64, say: bool) {
+    let mut top = SEND_TOP.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((all, since)) = top.as_mut() else {
+        return;
+    };
+    *since += frames;
+    if !say {
+        return;
+    }
+    let frames = since.max(1.0);
+    let mut most: Vec<(&(u64, u64), &[u64; 6])> = all.iter().collect();
+    most.sort_by_key(|(_, s)| std::cmp::Reverse(s[1]));
+    let ranges: u64 = most.iter().map(|(_, s)| s[1]).sum();
+    let line: Vec<String> = most
+        .iter()
+        .take(8)
+        .map(|((start, len), s)| {
+            format!(
+                "{start:#x}+{:.1} MiB: {:.0} ranges ({:.0} as words) {:.2} MB in {:.1} sends, declared written in {:.1} submissions ({:.2} MB)",
+                *len as f64 / 1048576.0,
+                s[1] as f64 / frames,
+                s[2] as f64 / frames,
+                s[3] as f64 / 1e6 / frames,
+                s[0] as f64 / frames,
+                s[4] as f64 / frames,
+                s[5] as f64 / 1e6 / frames
+            )
+        })
+        .collect();
+    tracing::info!(
+        "the copies most ranges went up to, per frame ({} copies, {:.0} ranges in all): {}",
+        most.len(),
+        ranges as f64 / frames,
+        line.join("; ")
+    );
+    *top = None;
+}
+
 fn send_split_time(i: usize, since: std::time::Instant) {
     SEND_SPLIT[12 + i].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
@@ -4514,6 +4577,7 @@ impl Host {
         gathering.end();
         send_split_time(0, began);
         send_split_note(&dirty);
+        send_top_note(&dirty, &declared);
         if declared.is_empty() && dirty.is_empty() && looked.is_empty() {
             return None;
         }
@@ -9467,6 +9531,7 @@ impl Meter {
             // Copies in the card's memory (`crate::shadow::cards`).
             let card = crate::shadow::card_stats();
             let split: Vec<f64> = SEND_SPLIT.iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            send_top_line(frames, five);
             #[cfg(feature = "diagnostics")]
             let slow = crate::watch::slow_asks();
             // Over the same frames as the counts above.
